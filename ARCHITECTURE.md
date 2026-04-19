@@ -1,0 +1,176 @@
+# Architecture
+
+How Format Flipper converts between 9 formats using 18 functions instead of 72.
+
+## The problem
+
+Given N formats, naive conversion requires N × (N−1) conversion functions — every format to every other format. For 9 formats, that's 72 functions to write, test, and maintain.
+
+```
+JSON → YAML         YAML → JSON         TOML → JSON         CSV → JSON    ...
+JSON → TOML         YAML → TOML         TOML → YAML         CSV → YAML    ...
+JSON → CSV          YAML → CSV          TOML → CSV          CSV → TOML    ...
+...                 ...                 ...                  ...
+```
+
+Adding a tenth format costs 18 more functions (to and from every existing format). Adding the eleventh costs 20. The complexity is O(N²).
+
+## The solution: star topology
+
+Every format has a parser that converts **format → value** and a serializer that converts **value → format**. Conversion between any two formats is the composition of parse and serialize with the intermediate value in the middle.
+
+```
+Input:  '{ "name": "Tooly" }'   (JSON)
+
+Step 1:  JSON parser  → { name: "Tooly" }   (plain JS object)
+
+Step 2:  YAML serializer  → "name: Tooly\n"   (YAML)
+```
+
+The cost of adding a format is now **one parse function and one serialize function**. That's it — the format instantly works with every other format in both directions, because the router just composes the pair with any other format's pair.
+
+For 9 formats, this is 18 functions instead of 72. For 20 formats, it would be 40 functions instead of 380. The complexity is O(N).
+
+This is the approach [Pandoc](https://pandoc.org) uses for document formats, simplified here for tabular data and simple object hierarchies.
+
+## The intermediate representation
+
+The intermediate representation is deliberately minimal: **plain JavaScript values.** Objects, arrays, strings, numbers, booleans, and null. That's the whole thing. No custom node types, no wrappers, no traversal helpers.
+
+```javascript
+parseJson('{"name": "Tooly", "tools": ["json", "yaml"]}')
+// → { name: "Tooly", tools: ["json", "yaml"] }
+
+parseYaml('name: Tooly\ntools:\n  - json\n  - yaml')
+// → { name: "Tooly", tools: ["json", "yaml"] }
+
+parseToml('name = "Tooly"\ntools = ["json", "yaml"]')
+// → { name: "Tooly", tools: ["json", "yaml"] }
+```
+
+Using plain JS as the intermediate buys three things:
+
+1. **No marshaling cost.** A parser returns exactly what you'd serialize.
+2. **No traversal layer.** You can `JSON.stringify` the intermediate and get the JSON output for free.
+3. **Ecosystem compatibility.** Every JS library that accepts "an object" accepts the intermediate.
+
+It loses one thing: there's no place to store metadata that doesn't fit JS values cleanly — comments, custom date types, precision flags. These are handled case by case (see "Where the topology breaks" below).
+
+For the formats that have native structure (JSON, YAML, TOML), the intermediate IS the parsed value — no conversion step. For tabular formats (CSV, TSV, SQL), the parser interprets the first row as headers and emits an array of objects. For document formats (XML, HTML, Markdown), the parser emits a nested structure that's reasonable for the format's tabular/hierarchical subset.
+
+## Where the topology breaks
+
+Three places where the intermediate value is lossy by design, and what the fallback is.
+
+### Comments
+
+JSON, CSV, TSV have no comment syntax. YAML, TOML, XML, HTML, Markdown, and SQL all do. Round-tripping `YAML (with comments) → JSON → YAML` loses the comments because JSON can't represent them.
+
+**Decision:** Comments are dropped on parse. There's no good place to store them alongside plain JavaScript values without inventing a wrapper type, and inventing a wrapper type gives up the "intermediate is just a JS value" simplicity that pays for itself everywhere else.
+
+### Dates
+
+TOML has a first-class date type. JSON doesn't. YAML sometimes parses an ISO 8601 string as a date and sometimes doesn't depending on the parser version. CSV is always a string.
+
+**Decision:** Dates round-trip as ISO 8601 strings. A TOML date becomes a JSON string `"2024-10-08T14:11:35Z"` in transit, which re-parses as a string if converted back to TOML. This is lossy (the target TOML is a string, not a date) but predictable.
+
+See [the ISO 8601 vs Unix epoch article](https://toolymctoolface.com/blog/iso-8601-vs-unix-epoch/) for why this format was chosen.
+
+### Arbitrary precision numbers
+
+JSON's spec allows any precision. JavaScript's `JSON.parse` clamps integers at 2^53. TOML integers are 64-bit. An integer larger than 2^53 in TOML, parsed through JavaScript, round-trips with precision loss.
+
+**Decision:** Numbers live in the intermediate representation as JavaScript `Number`. Beyond 2^53, precision is lost. Workaround documented in tool UI: for very large integers, stringify them in the source format.
+
+See [the JSON vs YAML vs TOML article](https://toolymctoolface.com/blog/json-yaml-toml/) for the longer version of this gotcha.
+
+## The router
+
+The function that composes parse and serialize is simple:
+
+```javascript
+function convert(input, fromFormat, toFormat) {
+  if (fromFormat === toFormat) return input;
+  const value = PARSERS[fromFormat](input);
+  return SERIALIZERS[toFormat](value);
+}
+```
+
+That's the entire conversion engine. Everything else is in the parse and serialize functions for each format. `value` is just a plain JavaScript value — an object, array, string, number, or composition thereof.
+
+## The 9 parsers and serializers
+
+Each lives in its own section of `index.html` (not yet extracted into separate files, but clearly delineated). Quick summary of the non-obvious choices:
+
+### JSON
+
+- Uses native `JSON.parse` / `JSON.stringify`
+- Accepts JSONC (comments + trailing commas) as input via a pre-processor
+- Serializes with 2-space indent by default
+
+### YAML
+
+- Uses bundled `js-yaml` for both directions (YAML 1.2)
+- Quotes strings that would be ambiguous (e.g., `"yes"`, `"no"`, numeric-looking strings)
+- This is the one place where the bundle size is non-trivial (~39 KB for js-yaml)
+
+### TOML
+
+- Custom parser, hand-written in ~400 lines
+- Supports the TOML 1.0 subset that matters for config files: scalars, tables, inline tables, array-of-tables, dates
+- Serializer preserves pair ordering, emits idiomatic TOML (bare keys when possible, quoted keys when required)
+
+### CSV and TSV
+
+- RFC 4180 compliant for CSV
+- Handles quoted fields with embedded commas and newlines
+- First row is treated as header on parse
+- On serialize, arrays of objects become rows; everything else stringifies the top-level
+
+### XML
+
+- Simple DOM-level model: elements, attributes, text nodes
+- Attributes become object keys with `@`-prefix (XSLT-style convention)
+- No DTD or namespace support — just the subset used for data exchange
+
+### Markdown
+
+- Parses tables, lists, headings, code blocks, links
+- Serializes back to GFM-style syntax
+- Not trying to be a full Markdown parser (that's a different project)
+
+### HTML
+
+- Extracts tables, lists, document structure
+- Strips style and script tags
+- Serializes clean minimal HTML without inline styles
+
+### SQL
+
+- Recognizes `CREATE TABLE` + `INSERT INTO` patterns for tabular round-tripping
+- Serializer emits the same two statements for any array-of-objects input
+- Not a general SQL parser
+
+## Adding a new format
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md). The short version:
+
+1. Write a `parseXxx(input) → value` function (returns a plain JS object/array/scalar).
+2. Write a `serializeXxx(value) → string` function.
+3. Register both in the `PARSERS` and `SERIALIZERS` objects.
+4. Add the format to the UI's format selector.
+5. Add tests for the round-trip and at least two cross-format conversions.
+
+Total effort: usually 100-300 lines of new code, plus tests.
+
+## Why single-file?
+
+The whole tool is one HTML file because:
+
+- **Durability.** As long as browsers run JavaScript, this file works. No build chain to break, no dependencies to patch.
+- **Offline.** First page load caches everything; subsequent uses need no network.
+- **Forkable.** View Source shows everything. No obfuscation, no transpiled bundle.
+- **Fast.** No framework boot time. 40 ms to interactive on a 2024 MacBook.
+- **Auditable.** You can read the entire tool in ~4000 lines of HTML+JS.
+
+If you want to extract the parsers into a proper npm package for server-side use, you're welcome to — the MIT license permits it. An organized extraction is on the project roadmap as a follow-on release.
